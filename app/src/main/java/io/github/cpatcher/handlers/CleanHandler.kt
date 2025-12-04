@@ -1,64 +1,77 @@
 package io.github.cpatcher.handlers
 
 import android.app.Application
-import android.os.Process
+import android.content.Context
 import io.github.cpatcher.arch.IHook
 import io.github.cpatcher.arch.hookAfter
-import io.github.cpatcher.logI
 import io.github.cpatcher.logE
+import io.github.cpatcher.logI
 import java.io.File
 import java.util.concurrent.Executors
 
 /**
- * CleanHandler (Fixed Version)
- * Sử dụng thông tin có sẵn từ IHook (như mã gốc) để tránh lỗi thiếu API ẩn.
+ * CleanHandler (Steel Core Version)
+ * Tuân thủ nghiêm ngặt 5 quy tắc bất biến:
+ * 1. Scope Isolation: Check package trước khi hook.
+ * 2. Data Hierarchy: Dùng loadPackageParam và Context, KHÔNG dùng Hidden API thừa thãi.
+ * 3. DSL Architecture: Dùng hookAfter.
+ * 4. Resiliency: Error handling toàn diện, Background thread priority thấp.
+ * 5. Logging: Log chuẩn format.
  */
 class CleanHandler : IHook() {
 
     companion object {
         private const val THREAD_NAME = "Cpatcher-Cleaner"
         
-        // Priority thấp để không làm chậm App khi khởi động
+        // Rule 4: Background Execution với Low Priority để không ảnh hưởng Cold Start của App
         private val cleanupExecutor = Executors.newSingleThreadExecutor { r ->
             Thread(r, THREAD_NAME).apply {
-                priority = Thread.MIN_PRIORITY
+                priority = Thread.MIN_PRIORITY // Ưu tiên thấp nhất
                 isDaemon = true
             }
         }
     }
 
     override fun onHook() {
-        // 1. Dùng loadPackageParam có sẵn (Giống mã gốc) - Không cần ActivityThread
-        // loadPackageParam được thừa hưởng từ lớp cha IHook
-        if (loadPackageParam.packageName == "io.github.cpatcher") return
+        // Rule 1: Scope Isolation (The Golden Rule)
+        // Loại bỏ chính module và System Server (an toàn 2 lớp dù Entry đã check)
+        if (loadPackageParam.packageName == "io.github.cpatcher" || 
+            loadPackageParam.packageName == "android") return
 
-        // 2. Hook bằng DSL (Cải tiến mới)
+        // Rule 3: DSL Architecture Standard
+        // Hook vào Application.onCreate để đảm bảo Context đã sẵn sàng
         Application::class.java.hookAfter("onCreate") { param ->
+            // Sử dụng safe cast để tránh crash
             val app = param.thisObject as? Application ?: return@hookAfter
 
+            // Rule 4: Resiliency - Zero Crash Policy
             runCatching {
-                // Lấy thông tin an toàn
+                // Rule 2: Data Hierarchy - Level 1 (IHook Data)
+                // Không gọi ActivityThread hay Reflection ở đây
                 val pkgName = loadPackageParam.packageName
                 val procName = loadPackageParam.processName
-                val uid = Process.myUid() // API chuẩn Android, không cần Stub
-
-                logI("CachePurge Init: $pkgName ($procName) [UID: $uid]")
                 
+                // Chỉ log Info một lần khi init thành công
+                logI("CachePurge Init: $pkgName ($procName)")
+
+                // Chuyển sang Background Thread ngay lập tức
                 performCleanup(app)
             }.onFailure {
-                logE("Failed to init cleanup", it)
+                logE("Failed to init CleanHandler hook", it)
             }
         }
     }
 
-    private fun performCleanup(context: Application) {
+    private fun performCleanup(context: Context) {
         cleanupExecutor.execute {
+            // Rule 4: Resiliency - Bắt lỗi trong Thread riêng để không crash app
             runCatching {
                 val start = System.currentTimeMillis()
                 var freedBytes = 0L
                 var fileCount = 0
 
-                // Context tự động trỏ đến đúng thư mục của User hiện tại (Giống mã gốc)
+                // Rule 2: Data Hierarchy - Level 2 (Context Data)
+                // Hệ điều hành tự động trả về path đúng cho User ID hiện tại (Dual Messenger, Work Profile...)
                 val cacheDirs = listOfNotNull(
                     context.externalCacheDir,
                     context.cacheDir,
@@ -73,22 +86,30 @@ class CleanHandler : IHook() {
                     }
                 }
 
+                // Rule 5: Logging - Chỉ log khi có hành động thực tế để tránh spam
                 if (fileCount > 0) {
                     val time = System.currentTimeMillis() - start
                     logI("Cleaned: $fileCount files (${freedBytes / 1024} KB) in ${time}ms")
                 }
             }.onFailure {
-                // Silent fail để không spam log nếu không có quyền
+                // Silent fail hoặc logE tùy mức độ nghiêm trọng. 
+                // Với lỗi IO, logE là phù hợp để debug nhưng không crash.
+                logE("CleanHandler: Background cleanup error", it)
             }
         }
     }
 
+    /**
+     * Hàm đệ quy xóa file an toàn.
+     * Trả về Pair<BytesDeleted, FileCount>
+     */
     private fun deleteRecursively(file: File): Pair<Long, Int> {
         var size = 0L
         var count = 0
         
         if (!file.exists()) return 0L to 0
 
+        // Xử lý thư mục con trước
         if (file.isDirectory) {
             file.listFiles()?.forEach { child ->
                 val (childSize, childCount) = deleteRecursively(child)
@@ -97,8 +118,10 @@ class CleanHandler : IHook() {
             }
         }
 
-        // Không xóa thư mục gốc, chỉ xóa nội dung
-        val isRoot = file.name == "cache" || file.name == "code_cache"
+        // Rule 4: Logic an toàn
+        // Không xóa chính thư mục gốc (cache, code_cache) để tránh lỗi permission hoặc structure
+        val isRoot = file.name == "cache" || file.name == "code_cache" || file.name == "files"
+        
         if (!isRoot) {
             val length = file.length()
             if (file.delete()) {
