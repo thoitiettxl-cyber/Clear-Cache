@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Cpatcher-CachePurge</string>
+    <string name="xposed_desc">CachePurge</string>
+</resources>
