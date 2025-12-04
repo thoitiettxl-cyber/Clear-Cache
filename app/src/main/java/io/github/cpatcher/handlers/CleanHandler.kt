@@ -1,185 +1,122 @@
 package io.github.cpatcher.handlers
 
 import android.app.Application
-import android.content.Context
+import android.app.ActivityThread // Hidden API (Rikka Stub)
+import android.os.Process
+import android.os.UserHandle // Hidden API (Rikka Stub)
 import io.github.cpatcher.arch.IHook
-import io.github.cpatcher.arch.hookAllAfter
-import io.github.cpatcher.logE
+import io.github.cpatcher.arch.hookAfter
 import io.github.cpatcher.logI
+import io.github.cpatcher.logE
 import io.github.cpatcher.logW
 import java.io.File
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.ThreadFactory
 
 /**
- * CleanHandler - Automatic cache cleanup module for LSPosed-scoped applications
- * 
- * Technical approach:
- * - Hooks into Application.onCreate() for earliest possible cleanup
- * - Performs asynchronous deletion to avoid blocking UI thread
- * - Implements comprehensive error containment per directory
- * - Tracks cleanup metrics for performance monitoring
+ * CleanHandler (Hybrid Version)
+ * * Kết hợp sức mạnh của:
+ * 1. HookUtils DSL: Để can thiệp vào vòng đời Application.
+ * 2. Hidden APIs: Để truy xuất thông tin hệ thống (Process, User) không qua Reflection.
  */
 class CleanHandler : IHook() {
+
     companion object {
-        private const val CLEANUP_THREAD_NAME = "CpatcherCacheCleanup"
-        private const val CLEANUP_TIMEOUT_MS = 5000L
+        private const val THREAD_NAME = "Cpatcher-Cleaner"
+        
+        // Tối ưu hóa Thread: Priority thấp để không ảnh hưởng khởi động App
         private val cleanupExecutor = Executors.newSingleThreadExecutor { r ->
-            Thread(r, CLEANUP_THREAD_NAME).apply {
+            Thread(r, THREAD_NAME).apply {
                 priority = Thread.MIN_PRIORITY
                 isDaemon = true
             }
         }
     }
-    
+
     override fun onHook() {
-        // MANDATORY: Package validation - only process if we're in a targeted app
-        // Since this is a universal handler, we check if it's NOT our own module
-        if (loadPackageParam.packageName == "io.github.cpatcher") {
-            logI("${this::class.simpleName}: Skipping self-cleanup")
-            return
-        }
-        
-        // Hook Application onCreate for earliest cleanup opportunity
-        Application::class.java.hookAllAfter("onCreate") { param ->
-            val application = param.thisObject as? Application
-            if (application == null) {
-                logW("${this::class.simpleName}: Unable to cast to Application")
-                return@hookAllAfter
-            }
-            
+        // RULE 3: Isolation - Logic nằm gọn trong IHook
+        if (loadPackageParam.packageName == "io.github.cpatcher") return
+
+        // RULE 2: HookUtils DSL Standard
+        // Thay vì XposedHelpers.findAndHookMethod, ta dùng extension function
+        Application::class.java.hookAfter("onCreate") { param ->
+            val app = param.thisObject as? Application ?: return@hookAfter
+
             runCatching {
-                performCacheCleanup(application)
-            }.onFailure { t ->
-                logE("${this::class.simpleName}: Failed to initiate cache cleanup", t)
+                // RULE 1: Hybrid Interaction Mandate
+                // Gọi trực tiếp Hidden API, KHÔNG dùng Reflection.
+                // ActivityThread.currentProcessName() và UserHandle.myUserId()
+                // được cung cấp bởi thư viện dev.rikka.hidden.
+                val currentProcess = ActivityThread.currentProcessName()
+                val userId = UserHandle.myUserId()
+
+                logI("Initiating cache purge for $currentProcess (UID: ${Process.myUid()}, User: $userId)")
+                
+                performHybridCleanup(app)
+            }.onFailure {
+                logE("Failed to init cleanup hook", it)
             }
         }
-        
-        logI("${this::class.simpleName}: Successfully initialized for ${loadPackageParam.packageName}")
     }
-    
-    private fun performCacheCleanup(context: Context) {
+
+    private fun performHybridCleanup(context: Application) {
         cleanupExecutor.execute {
             runCatching {
-                val startTime = System.currentTimeMillis()
-                var totalDeleted = 0L
-                var filesDeleted = 0
-                
-                // External cache cleanup - typically largest
-                context.externalCacheDir?.let { dir ->
+                val start = System.currentTimeMillis()
+                var freedBytes = 0L
+                var fileCount = 0
+
+                // Danh sách các thư mục cache tiêu chuẩn
+                val cacheDirs = listOfNotNull(
+                    context.externalCacheDir,
+                    context.cacheDir,
+                    context.codeCacheDir
+                )
+
+                cacheDirs.forEach { dir ->
                     if (dir.exists()) {
-                        val result = deleteDirectoryContents(dir)
-                        totalDeleted += result.first
-                        filesDeleted += result.second
-                        logI("${this::class.simpleName}: External cache - " +
-                            "${result.second} files, ${result.first / 1024}KB")
+                        val (bytes, count) = deleteRecursively(dir)
+                        freedBytes += bytes
+                        fileCount += count
                     }
                 }
-                
-                // Internal cache cleanup
-                context.cacheDir?.let { dir ->
-                    if (dir.exists()) {
-                        val result = deleteDirectoryContents(dir)
-                        totalDeleted += result.first
-                        filesDeleted += result.second
-                        logI("${this::class.simpleName}: Internal cache - " +
-                            "${result.second} files, ${result.first / 1024}KB")
-                    }
+
+                if (fileCount > 0) {
+                    val time = System.currentTimeMillis() - start
+                    logI("Cleanup complete: Removed $fileCount files (${freedBytes / 1024} KB) in ${time}ms")
                 }
-                
-                // Code cache cleanup - JIT compiled code
-                context.codeCacheDir?.let { dir ->
-                    if (dir.exists()) {
-                        val result = deleteDirectoryContents(dir)
-                        totalDeleted += result.first
-                        filesDeleted += result.second
-                        logI("${this::class.simpleName}: Code cache - " +
-                            "${result.second} files, ${result.first / 1024}KB")
-                    }
-                }
-                
-                val elapsed = System.currentTimeMillis() - startTime
-                
-                if (filesDeleted > 0) {
-                    logI("${this::class.simpleName}: Cleanup completed - " +
-                        "$filesDeleted files, ${totalDeleted / 1024}KB in ${elapsed}ms")
-                } else {
-                    logI("${this::class.simpleName}: No cache files to clean")
-                }
-                
-            }.onFailure { t ->
-                logE("${this::class.simpleName}: Cache cleanup thread failed", t)
+            }.onFailure {
+                logE("Cleanup thread error", it)
             }
         }
     }
-    
-    /**
-     * Recursively deletes directory contents while preserving the root directory
-     * @return Pair of (total bytes deleted, file count)
-     */
-    private fun deleteDirectoryContents(directory: File): Pair<Long, Int> {
-        var totalSize = 0L
-        var fileCount = 0
-        
-        runCatching {
-            directory.listFiles()?.forEach { file ->
-                val result = deleteRecursively(file)
-                totalSize += result.first
-                fileCount += result.second
-            }
-        }.onFailure { t ->
-            logE("${this::class.simpleName}: Failed to list ${directory.absolutePath}", t)
-        }
-        
-        return Pair(totalSize, fileCount)
-    }
-    
-    /**
-     * Recursively deletes a file or directory
-     * @return Pair of (total bytes deleted, file count)
-     */
+
+    // Helper: Đệ quy xóa file an toàn, trả về (Bytes, Số lượng)
     private fun deleteRecursively(file: File): Pair<Long, Int> {
-        if (!file.exists()) return Pair(0L, 0)
+        var size = 0L
+        var count = 0
         
-        var totalSize = 0L
-        var fileCount = 0
-        
-        runCatching {
-            if (file.isDirectory) {
-                file.listFiles()?.forEach { child ->
-                    val result = deleteRecursively(child)
-                    totalSize += result.first
-                    fileCount += result.second
-                }
+        if (!file.exists()) return 0L to 0
+
+        if (file.isDirectory) {
+            file.listFiles()?.forEach { child ->
+                val (childSize, childCount) = deleteRecursively(child)
+                size += childSize
+                count += childCount
             }
-            
-            val fileSize = file.length()
+        }
+
+        // Không xóa thư mục gốc (cache, code_cache) để tránh lỗi permission cục bộ
+        // Chỉ xóa nội dung bên trong hoặc thư mục con
+        val isRootCache = file.name == "cache" || file.name == "code_cache"
+        if (!isRootCache) {
+            val length = file.length()
             if (file.delete()) {
-                totalSize += fileSize
-                fileCount++
-            }
-            
-        }.onFailure { t ->
-            // Silent failure for individual files - don't spam logs
-            if (file.isDirectory) {
-                logW("${this::class.simpleName}: Failed to delete directory ${file.name}")
+                size += length
+                count++
             }
         }
         
-        return Pair(totalSize, fileCount)
-    }
-    
-    /**
-     * Cleanup executor on module unload (if supported by framework)
-     */
-    fun cleanup() {
-        runCatching {
-            cleanupExecutor.shutdown()
-            if (!cleanupExecutor.awaitTermination(CLEANUP_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                cleanupExecutor.shutdownNow()
-            }
-        }.onFailure { t ->
-            logE("${this::class.simpleName}: Failed to shutdown executor", t)
-        }
+        return size to count
     }
 }
